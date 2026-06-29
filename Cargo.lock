@@ -86,6 +86,7 @@ dependencies = [
 name = "vault"
 version = "0.1.0"
 dependencies = [
+ "core-foundation",
  "rustix",
  "security-framework",
  "security-framework-sys",

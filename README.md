@@ -2,7 +2,55 @@
 
 Store secrets in the macOS Keychain and inject them into commands.
 
-## Usage
+## Install
+
+### From source
+
+```bash
+make install
+```
+
+This builds the `dist` profile, code-signs the binary, and installs to `~/usr/bin/vault`.
+
+Before your first build, create a self-signed code-signing identity (one-time setup):
+
+```bash
+/usr/bin/openssl req -x509 -newkey rsa:2048 \
+  -keyout /tmp/vault-key.pem -out /tmp/vault-cert.pem \
+  -days 3650 -nodes \
+  -subj "/CN=Vault Signing" \
+  -addext "basicConstraints=critical,CA:false" \
+  -addext "keyUsage=critical,digitalSignature" \
+  -addext "extendedKeyUsage=codeSigning"
+/usr/bin/openssl pkcs12 -export \
+  -out /tmp/vault-cert.p12 \
+  -inkey /tmp/vault-key.pem -in /tmp/vault-cert.pem \
+  -passout pass:vault
+security import /tmp/vault-cert.p12 \
+  -k ~/Library/Keychains/login.keychain-db \
+  -P vault -T /usr/bin/codesign -A
+rm /tmp/vault-key.pem /tmp/vault-cert.pem /tmp/vault-cert.p12
+```
+
+Code-signing gives vault a stable identity so macOS stops prompting for keychain access on every rebuild.
+
+### Prebuilt binary
+
+Download the `vault` binary for your architecture, then:
+
+```bash
+# Remove the quarantine flag (macOS Gatekeeper)
+xattr -d com.apple.quarantine vault
+
+# Ad-hoc sign it. This gives the binary a stable identity so macOS only
+# asks for keychain access once.
+codesign --sign - --force --timestamp=none vault
+
+# Move it somewhere on your PATH
+mv vault ~/usr/bin/vault
+```
+
+The ad-hoc signature (`--sign -`) ties the identity to this exact binary — it won't survive updates, but you won't rebuild either. Each new download will prompt once for keychain access.
 
 ### Store a secret
 

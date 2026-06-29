@@ -13,6 +13,7 @@ Usage:
   vault get   <NAME>            Print a secret to stdout
   vault rm    <NAME>            Delete a secret
   vault ls                      List all stored secret names
+  vault purge                   Delete every secret vault manages
 
   vault [ENV ...] -- <CMD> [ARGS ...]   Run CMD with secrets injected
 
@@ -44,6 +45,7 @@ fn main() {
         "get" => cmd_get(&args),
         "rm" => cmd_rm(&args),
         "ls" => cmd_ls(&args),
+        "purge" => cmd_purge(),
         "-h" | "--help" | "help" => {
             print!("{}", USAGE);
         }
@@ -120,6 +122,17 @@ fn cmd_ls(args: &[String]) {
     }
 }
 
+fn cmd_purge() {
+    match keychain::purge_secrets() {
+        Ok(0) => println!("nothing to purge"),
+        Ok(n) => println!("purged {n} secret{}", if n == 1 { "" } else { "s" }),
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    }
+}
+
 fn exec_mode(args: &[String]) {
     let dash_pos = args.iter().position(|a| a == "--");
 
@@ -164,14 +177,14 @@ fn exec_mode(args: &[String]) {
 fn read_secret(name: &str, silent: bool) -> String {
     if io::stdin().is_terminal() {
         if !silent {
-            eprint!("Enter value for {}: ", name);
+            eprint!("Enter value for {name}: ");
             io::stderr().flush().unwrap();
         }
-        read_without_echo()
+        read_without_echo(silent)
     } else {
         let mut value = String::new();
         io::stdin().read_to_string(&mut value).unwrap_or_else(|e| {
-            eprintln!("vault: failed to read stdin: {}", e);
+            eprintln!("vault: failed to read stdin: {e}");
             process::exit(1);
         });
         strip_trailing_newline(&mut value);
@@ -179,7 +192,10 @@ fn read_secret(name: &str, silent: bool) -> String {
     }
 }
 
-fn read_without_echo() -> String {
+/// Read a secret from the terminal with echo disabled. Prints `*` for each
+/// character typed so the user has visual feedback (unless `silent` is true,
+/// for `isset`).
+fn read_without_echo(silent: bool) -> String {
     use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
 
     let stdin = io::stdin();
@@ -191,8 +207,11 @@ fn read_without_echo() -> String {
         return value;
     };
 
+    // Disable echo and canonical (line-buffered) mode so we can read one
+    // byte at a time and print feedback characters. ISIG is left enabled so
+    // Ctrl-C still delivers SIGINT.
     let mut termios = original.clone();
-    termios.local_modes &= !(LocalModes::ECHO | LocalModes::ECHONL);
+    termios.local_modes &= !(LocalModes::ECHO | LocalModes::ECHONL | LocalModes::ICANON);
     let _ = tcsetattr(&stdin, OptionalActions::Now, &termios);
 
     // Restore terminal on drop — works for panics and early returns.
@@ -206,21 +225,50 @@ fn read_without_echo() -> String {
     }
 
     let mut value = String::new();
-    let result = {
+    let mut stderr = io::stderr();
+    {
         let _restore = Restore(stdin, original);
-        io::stdin().read_line(&mut value)
-    };
-
-    match result {
-        Ok(_) => {
-            strip_trailing_newline(&mut value);
-            value
-        }
-        Err(e) => {
-            eprintln!("vault: failed to read input: {}", e);
-            process::exit(1);
+        let mut stdin = io::stdin().lock();
+        let mut buf = [0u8; 1];
+        loop {
+            match stdin.read_exact(&mut buf) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("\nvault: failed to read input: {e}");
+                    process::exit(1);
+                }
+            }
+            match buf[0] {
+                b'\n' | b'\r' => break,
+                0x7f => {
+                    // Backspace (DEL). Remove last character from both the
+                    // stored value and the on-screen feedback.
+                    if value.pop().is_some() && !silent {
+                        // "\x08 \x08" = backspace, space, backspace
+                        let _ = stderr.write_all(b"\x08 \x08");
+                        let _ = stderr.flush();
+                    }
+                }
+                b => {
+                    // Any other byte is appended verbatim. For display we
+                    // print a single '*' regardless of the byte width
+                    // (multibyte UTF-8 sequences each produce one '*').
+                    value.push(b as char);
+                    if !silent {
+                        let _ = stderr.write_all(b"*");
+                        let _ = stderr.flush();
+                    }
+                }
+            }
         }
     }
+
+    // Newline after the last '*' so the prompt doesn't collide with output.
+    if !silent {
+        let _ = stderr.write_all(b"\n");
+    }
+
+    value
 }
 
 fn strip_trailing_newline(s: &mut String) {

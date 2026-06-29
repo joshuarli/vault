@@ -7,6 +7,7 @@ edition = "2024"
 security-framework = "3"
 security-framework-sys = "2"
 rustix = { version = "1", features = ["termios"] }
+core-foundation = "0.10"
 
 [profile.dev]
 debug = 0

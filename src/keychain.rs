@@ -2,26 +2,181 @@ use std::process::Command;
 
 const SERVICE: &str = "dev.joshuarli.vault";
 
+// Production implementation — real macOS Keychain via Security framework.
+//
+// Keychain ACL model (important, non-obvious):
+//
+//   When SecItemAdd creates a keychain item, macOS automatically adds an
+//   application-specific ACL entry that restricts access to the exact binary
+//   that created it (matched by filesystem path AND cdhash — the code-directory
+//   hash embedded in the ad-hoc signature). Every `cargo build` produces a new
+//   cdhash, so the freshly-built vault binary can't access items created by the
+//   previous build. The old items still exist — macOS just denies access.
+//
+//   The fix: create items with the legacy SecKeychainAddGenericPassword API,
+//   which does NOT stamp an application-specific ACL (items get
+//   `applications: <null>` — any app can access). Updates use the modern
+//   SecItemUpdate, which preserves the existing ACL. Both are single calls.
+//
+// Error reporting:
+//
+//   We preserve the actual Security framework error instead of mapping
+//   everything to "not found". An auth failure (errSecAuthFailed, -25293) and a
+//   genuinely missing item (errSecItemNotFound, -25300) need different
+//   remedies; collapsing them into one message made this bug hard to diagnose.
+//
 #[cfg(not(test))]
 mod imp {
+    use core_foundation::base::TCFType;
+    use core_foundation::data::CFData;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::CFString;
     use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
     use security_framework::passwords;
+    use security_framework_sys::base::{SecKeychainRef, errSecItemNotFound};
+    use security_framework_sys::item::{
+        kSecAttrAccount, kSecAttrService, kSecClass, kSecClassGenericPassword, kSecValueData,
+    };
+    use security_framework_sys::keychain::{SecKeychainAddGenericPassword, SecKeychainCopyDefault};
+    use security_framework_sys::keychain_item::{SecItemDelete, SecItemUpdate};
+    use std::ffi::{CString, c_void};
+
+    // Pointer-type coercion helper. The kSec* constants from
+    // security-framework-sys are typed as CFStringRef = *const __CFString;
+    // we need *const c_void for sec_str.
+    unsafe fn sec_str(c: *const c_void) -> CFString {
+        unsafe { CFString::wrap_under_get_rule(c as _) }
+    }
+
+    macro_rules! k {
+        ($const:ident) => {
+            ($const as *const c_void)
+        };
+    }
+
+    /// Build a query dict for matching a vault item by service + account.
+    fn query_dict(
+        service: &str,
+        name: &str,
+    ) -> CFDictionary<CFString, core_foundation::base::CFType> {
+        let pairs: Vec<(CFString, core_foundation::base::CFType)> = vec![
+            (
+                unsafe { sec_str(k!(kSecClass)) },
+                unsafe { sec_str(k!(kSecClassGenericPassword)) }.into_CFType(),
+            ),
+            (
+                unsafe { sec_str(k!(kSecAttrService)) },
+                CFString::from(service).into_CFType(),
+            ),
+            (
+                unsafe { sec_str(k!(kSecAttrAccount)) },
+                CFString::from(name).into_CFType(),
+            ),
+        ];
+        CFDictionary::from_CFType_pairs(&pairs)
+    }
+
+    /// Create a new keychain item. Uses the legacy SecKeychainAddGenericPassword
+    /// API because it creates items with `applications: <null>` in a single
+    /// call — no ACL fix-up step needed.
+    fn create(service: &str, name: &str, value: &[u8]) -> Result<(), String> {
+        let service_c =
+            CString::new(service).map_err(|e| format!("vault: invalid service name: {e}"))?;
+        let account_c =
+            CString::new(name).map_err(|e| format!("vault: invalid account name: {e}"))?;
+
+        let mut keychain: SecKeychainRef = std::ptr::null_mut();
+        let status = unsafe { SecKeychainCopyDefault(&mut keychain) };
+        if status != 0 {
+            return Err(format!(
+                "vault: set failed: SecKeychainCopyDefault OSStatus {status}"
+            ));
+        }
+
+        let status = unsafe {
+            SecKeychainAddGenericPassword(
+                keychain,
+                service_c.as_bytes().len() as u32,
+                service_c.as_ptr(),
+                account_c.as_bytes().len() as u32,
+                account_c.as_ptr(),
+                value.len() as u32,
+                value.as_ptr() as *const c_void,
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            return Err(format!("vault: set failed: OSStatus {status}"));
+        }
+        Ok(())
+    }
 
     pub fn set(service: &str, name: &str, value: &[u8]) -> Result<(), String> {
-        let _ = passwords::delete_generic_password(service, name);
-        passwords::set_generic_password(service, name, value).map_err(|e| format!("vault: {}", e))
+        // Try update first — one call for the common "change a secret" case.
+        let query = query_dict(service, name);
+
+        let update_pairs: Vec<(CFString, core_foundation::base::CFType)> = vec![(
+            unsafe { sec_str(k!(kSecValueData)) },
+            CFData::from_buffer(value).into_CFType(),
+        )];
+        let update = CFDictionary::from_CFType_pairs(&update_pairs);
+
+        let status =
+            unsafe { SecItemUpdate(query.as_concrete_TypeRef(), update.as_concrete_TypeRef()) };
+
+        if status == 0 {
+            return Ok(());
+        }
+
+        if status == errSecItemNotFound {
+            return create(service, name, value);
+        }
+
+        Err(format!(
+            "vault: set failed: SecItemUpdate returned OSStatus {status}"
+        ))
     }
 
     pub fn get(service: &str, name: &str) -> Result<String, String> {
         let password = passwords::get_generic_password(service, name)
-            .map_err(|_| format!("vault: {} not found", name))?;
-        String::from_utf8(password).map_err(|e| format!("vault: invalid UTF-8 in {}: {}", name, e))
+            .map_err(|e| format!("vault: {name}: {e}"))?;
+        String::from_utf8(password).map_err(|e| format!("vault: invalid UTF-8 in {name}: {e}"))
     }
 
     pub fn remove(service: &str, name: &str) -> Result<(), String> {
-        passwords::get_generic_password(service, name)
-            .map_err(|_| format!("vault: {} not found", name))?;
-        passwords::delete_generic_password(service, name).map_err(|e| format!("vault: {}", e))
+        let del_err = match passwords::delete_generic_password(service, name) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        match passwords::get_generic_password(service, name) {
+            Ok(_) => Err(format!("vault: {name}: {del_err}")),
+            Err(get_err) => Err(format!("vault: {name}: {get_err}")),
+        }
+    }
+
+    pub fn purge(service: &str) -> Result<usize, String> {
+        let before = list(service)?.len();
+        if before == 0 {
+            return Ok(0);
+        }
+        // SecItemDelete with a service-only query (no account filter) removes
+        // every generic password under that service in one call.
+        let pairs: Vec<(CFString, core_foundation::base::CFType)> = vec![
+            (
+                unsafe { sec_str(k!(kSecClass)) },
+                unsafe { sec_str(k!(kSecClassGenericPassword)) }.into_CFType(),
+            ),
+            (
+                unsafe { sec_str(k!(kSecAttrService)) },
+                CFString::from(service).into_CFType(),
+            ),
+        ];
+        let params = CFDictionary::from_CFType_pairs(&pairs);
+        let status = unsafe { SecItemDelete(params.as_concrete_TypeRef()) };
+        if status != 0 {
+            return Err(format!("vault: purge failed: OSStatus {status}"));
+        }
+        Ok(before)
     }
 
     pub fn list(service: &str) -> Result<Vec<String>, String> {
@@ -36,7 +191,7 @@ mod imp {
             Err(e) if e.code() == security_framework_sys::base::errSecItemNotFound => {
                 return Ok(Vec::new());
             }
-            Err(e) => return Err(format!("vault: {}", e)),
+            Err(e) => return Err(format!("vault: {e}")),
         };
 
         let mut names = Vec::new();
@@ -51,6 +206,9 @@ mod imp {
     }
 }
 
+// In-memory test store. Keeps unit tests fast and free of macOS keychain
+// approval prompts. The integration tests in tests/ cover the real keychain
+// path (gated behind #[ignore]).
 #[cfg(test)]
 #[allow(clippy::disallowed_types)]
 mod imp {
@@ -72,7 +230,7 @@ mod imp {
         let guard = STORE.lock().unwrap();
         let value = guard
             .get(&(service.to_string(), name.to_string()))
-            .ok_or_else(|| format!("vault: {} not found", name))?;
+            .ok_or_else(|| format!("vault: {}: not found", name))?;
         String::from_utf8(value.clone())
             .map_err(|e| format!("vault: invalid UTF-8 in {}: {}", name, e))
     }
@@ -83,7 +241,15 @@ mod imp {
             .unwrap()
             .remove(&(service.to_string(), name.to_string()))
             .map(|_| ())
-            .ok_or_else(|| format!("vault: {} not found", name))
+            .ok_or_else(|| format!("vault: {}: not found", name))
+    }
+
+    pub fn purge(service: &str) -> Result<usize, String> {
+        let service = service.to_string();
+        let mut guard = STORE.lock().unwrap();
+        let before = guard.keys().filter(|(s, _)| *s == service).count();
+        guard.retain(|(s, _), _| *s != service);
+        Ok(before)
     }
 
     pub fn list(service: &str) -> Result<Vec<String>, String> {
@@ -109,6 +275,10 @@ pub fn get_secret(name: &str) -> Result<String, String> {
 
 pub fn delete_secret(name: &str) -> Result<(), String> {
     imp::remove(SERVICE, name)
+}
+
+pub fn purge_secrets() -> Result<usize, String> {
+    imp::purge(SERVICE)
 }
 
 pub fn list_secrets() -> Result<Vec<String>, String> {
@@ -240,5 +410,36 @@ mod tests {
         assert!(names.contains(&k("LV")));
         assert!(!names.contains(&"secret-value-123".to_string()));
         delete_secret(&k("LV")).unwrap();
+    }
+
+    #[test]
+    fn purge_removes_all_for_service() {
+        // Clean up from any previous run, then add three items.
+        for name in list_secrets().unwrap() {
+            if name.starts_with("TEST_P") {
+                delete_secret(&name).unwrap();
+            }
+        }
+        set_secret(&k("P1"), b"a").unwrap();
+        set_secret(&k("P2"), b"b").unwrap();
+        set_secret(&k("P3"), b"c").unwrap();
+
+        let count = purge_secrets().unwrap();
+        assert!(count >= 3, "expected at least 3 purged, got {count}");
+
+        let names = list_secrets().unwrap();
+        assert!(!names.contains(&k("P1")));
+        assert!(!names.contains(&k("P2")));
+        assert!(!names.contains(&k("P3")));
+    }
+
+    #[test]
+    fn purge_empty_returns_zero() {
+        for name in list_secrets().unwrap() {
+            if name.starts_with("TEST_") {
+                delete_secret(&name).unwrap();
+            }
+        }
+        assert_eq!(purge_secrets().unwrap(), 0);
     }
 }
