@@ -8,9 +8,10 @@ vault — macOS Keychain secret manager
 
 Usage:
 
-  vault set <NAME>              Store a secret
-  vault get <NAME>              Print a secret to stdout
-  vault rm  <NAME>              Delete a secret
+  vault set   <NAME>            Store a secret (prompts for value)
+  vault isset <NAME>            Store a secret (silent, no prompt)
+  vault get   <NAME>            Print a secret to stdout
+  vault rm    <NAME>            Delete a secret
   vault ls                      List all stored secret names
 
   vault [ENV ...] -- <CMD> [ARGS ...]   Run CMD with secrets injected
@@ -38,7 +39,8 @@ fn main() {
     let first = &args[1];
 
     match first.as_str() {
-        "set" => cmd_set(&args),
+        "set" => cmd_set(&args, false),
+        "isset" => cmd_set(&args, true),
         "get" => cmd_get(&args),
         "rm" => cmd_rm(&args),
         "ls" => cmd_ls(&args),
@@ -64,10 +66,10 @@ fn require_exact_args(args: &[String], cmd: &str, expected: usize) {
     }
 }
 
-fn cmd_set(args: &[String]) {
-    require_exact_args(args, "set", 3);
+fn cmd_set(args: &[String], silent: bool) {
+    require_exact_args(args, if silent { "isset" } else { "set" }, 3);
     let name = &args[2];
-    let value = read_secret(name);
+    let value = read_secret(name, silent);
     if let Err(e) = keychain::set_secret(name, value.as_bytes()) {
         eprintln!("{}", e);
         process::exit(1);
@@ -159,10 +161,12 @@ fn exec_mode(args: &[String]) {
     keychain::spawn_and_exit(cmd);
 }
 
-fn read_secret(name: &str) -> String {
+fn read_secret(name: &str, silent: bool) -> String {
     if io::stdin().is_terminal() {
-        eprint!("Enter value for {}: ", name);
-        io::stderr().flush().unwrap();
+        if !silent {
+            eprint!("Enter value for {}: ", name);
+            io::stderr().flush().unwrap();
+        }
         read_without_echo()
     } else {
         let mut value = String::new();
