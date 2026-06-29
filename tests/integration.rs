@@ -74,7 +74,8 @@ fn get_missing_key_errors() {
 fn rm_missing_key_errors() {
     let out = vault(&["rm", "VAULT_TEST_NONEXISTENT"]).unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("could not be found"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not found"), "stderr: {stderr}");
 }
 
 #[test]

@@ -33,12 +33,14 @@ mod imp {
     use core_foundation::string::CFString;
     use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
     use security_framework::passwords;
-    use security_framework_sys::base::{SecKeychainRef, errSecItemNotFound};
+    use security_framework_sys::base::{SecKeychainItemRef, SecKeychainRef, errSecItemNotFound};
     use security_framework_sys::item::{
         kSecAttrAccount, kSecAttrService, kSecClass, kSecClassGenericPassword, kSecValueData,
     };
-    use security_framework_sys::keychain::{SecKeychainAddGenericPassword, SecKeychainCopyDefault};
-    use security_framework_sys::keychain_item::{SecItemDelete, SecItemUpdate};
+    use security_framework_sys::keychain::{
+        SecKeychainAddGenericPassword, SecKeychainCopyDefault, SecKeychainFindGenericPassword,
+    };
+    use security_framework_sys::keychain_item::{SecItemUpdate, SecKeychainItemDelete};
     use std::ffi::{CString, c_void};
 
     // Pointer-type coercion helper. The kSec* constants from
@@ -144,39 +146,48 @@ mod imp {
     }
 
     pub fn remove(service: &str, name: &str) -> Result<(), String> {
-        let del_err = match passwords::delete_generic_password(service, name) {
-            Ok(()) => return Ok(()),
-            Err(e) => e,
+        let service_c =
+            CString::new(service).map_err(|e| format!("vault: invalid service name: {e}"))?;
+        let account_c =
+            CString::new(name).map_err(|e| format!("vault: invalid account name: {e}"))?;
+
+        // Use the legacy API to find and delete. Like create(), this bypasses
+        // the application-specific ACL that SecItemAdd stamps on new items.
+        let mut item: SecKeychainItemRef = std::ptr::null_mut();
+        let status = unsafe {
+            SecKeychainFindGenericPassword(
+                std::ptr::null_mut(),
+                service_c.as_bytes().len() as u32,
+                service_c.as_ptr(),
+                account_c.as_bytes().len() as u32,
+                account_c.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut item,
+            )
         };
-        match passwords::get_generic_password(service, name) {
-            Ok(_) => Err(format!("vault: {name}: {del_err}")),
-            Err(get_err) => Err(format!("vault: {name}: {get_err}")),
+        if status == errSecItemNotFound {
+            return Err(format!("vault: {name}: not found"));
         }
+        if status != 0 {
+            return Err(format!("vault: {name}: find failed: OSStatus {status}"));
+        }
+        let del_status = unsafe { SecKeychainItemDelete(item) };
+        if del_status != 0 {
+            return Err(format!(
+                "vault: {name}: delete failed: OSStatus {del_status}"
+            ));
+        }
+        Ok(())
     }
 
     pub fn purge(service: &str) -> Result<usize, String> {
-        let before = list(service)?.len();
-        if before == 0 {
-            return Ok(0);
+        let names = list(service)?;
+        let count = names.len();
+        for name in &names {
+            remove(service, name)?;
         }
-        // SecItemDelete with a service-only query (no account filter) removes
-        // every generic password under that service in one call.
-        let pairs: Vec<(CFString, core_foundation::base::CFType)> = vec![
-            (
-                unsafe { sec_str(k!(kSecClass)) },
-                unsafe { sec_str(k!(kSecClassGenericPassword)) }.into_CFType(),
-            ),
-            (
-                unsafe { sec_str(k!(kSecAttrService)) },
-                CFString::from(service).into_CFType(),
-            ),
-        ];
-        let params = CFDictionary::from_CFType_pairs(&pairs);
-        let status = unsafe { SecItemDelete(params.as_concrete_TypeRef()) };
-        if status != 0 {
-            return Err(format!("vault: purge failed: OSStatus {status}"));
-        }
-        Ok(before)
+        Ok(count)
     }
 
     pub fn list(service: &str) -> Result<Vec<String>, String> {
@@ -437,7 +448,7 @@ mod tests {
     fn purge_empty_returns_zero() {
         for name in list_secrets().unwrap() {
             if name.starts_with("TEST_") {
-                delete_secret(&name).unwrap();
+                let _ = delete_secret(&name);
             }
         }
         assert_eq!(purge_secrets().unwrap(), 0);
