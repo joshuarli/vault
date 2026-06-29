@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'release/*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build release
+        run: make dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vault-aarch64-apple-darwin
+          path: target/aarch64-apple-darwin/dist/vault
+
+  release:
+    name: Create release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          V="${VERSION#release/}"
+          mv vault-aarch64-apple-darwin/vault "vault-${V}-aarch64-apple-darwin"
+          gh release create "$VERSION" "vault-${V}-aarch64-apple-darwin" --title "$V"

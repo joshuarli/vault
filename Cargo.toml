@@ -1,0 +1,27 @@
+[package]
+name = "vault"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+security-framework = "3"
+security-framework-sys = "2"
+rustix = { version = "1", features = ["termios"] }
+
+[profile.dev]
+debug = 0
+strip = "debuginfo"
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+panic = "abort"
+
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+# we're an exec wrapper; be as small as possible
+opt-level = "z"
+strip = true
+
