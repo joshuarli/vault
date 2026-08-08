@@ -1,5 +1,3 @@
-use std::process::Command;
-
 const SERVICE: &str = "dev.joshuarli.vault";
 
 // Production implementation — real macOS Keychain via Security framework.
@@ -226,8 +224,14 @@ mod imp {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
 
-    static STORE: LazyLock<Mutex<HashMap<(String, String), Vec<u8>>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
+    type Store = Mutex<HashMap<(String, String), Vec<u8>>>;
+
+    static STORE: LazyLock<Store> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    pub(super) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap()
+    }
 
     pub fn set(service: &str, name: &str, value: &[u8]) -> Result<(), String> {
         STORE
@@ -296,20 +300,9 @@ pub fn list_secrets() -> Result<Vec<String>, String> {
     imp::list(SERVICE)
 }
 
-/// Spawn `cmd` and exit this process with the child's exit status.
-/// If the child was killed by a signal, exits with 128 + signal number.
-pub fn spawn_and_exit(mut cmd: Command) -> ! {
-    use std::os::unix::process::ExitStatusExt;
-
-    let status = cmd.status().unwrap_or_else(|e| {
-        eprintln!("vault: {}", e);
-        std::process::exit(1);
-    });
-
-    if let Some(sig) = status.signal() {
-        std::process::exit(128 + sig);
-    }
-    std::process::exit(status.code().unwrap_or(1));
+#[cfg(test)]
+fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    imp::test_guard()
 }
 
 #[cfg(test)]
@@ -322,12 +315,14 @@ mod tests {
 
     #[test]
     fn roundtrip() {
+        let _guard = test_guard();
         set_secret(&k("R1"), b"hunter2").unwrap();
         assert_eq!(get_secret(&k("R1")).unwrap(), "hunter2");
     }
 
     #[test]
     fn overwrite_updates() {
+        let _guard = test_guard();
         set_secret(&k("OW"), b"first").unwrap();
         set_secret(&k("OW"), b"second").unwrap();
         assert_eq!(get_secret(&k("OW")).unwrap(), "second");
@@ -335,18 +330,21 @@ mod tests {
 
     #[test]
     fn get_missing_is_not_found() {
+        let _guard = test_guard();
         let err = get_secret(&k("NOEXIST")).unwrap_err();
         assert!(err.contains("not found"), "{err}");
     }
 
     #[test]
     fn delete_missing_is_not_found() {
+        let _guard = test_guard();
         let err = delete_secret(&k("NOEXIST")).unwrap_err();
         assert!(err.contains("not found"), "{err}");
     }
 
     #[test]
     fn delete_then_get_is_missing() {
+        let _guard = test_guard();
         set_secret(&k("DEL"), b"x").unwrap();
         delete_secret(&k("DEL")).unwrap();
         assert!(get_secret(&k("DEL")).unwrap_err().contains("not found"));
@@ -354,6 +352,7 @@ mod tests {
 
     #[test]
     fn double_delete_errors() {
+        let _guard = test_guard();
         set_secret(&k("DD"), b"x").unwrap();
         delete_secret(&k("DD")).unwrap();
         assert!(delete_secret(&k("DD")).unwrap_err().contains("not found"));
@@ -361,12 +360,14 @@ mod tests {
 
     #[test]
     fn empty_value() {
+        let _guard = test_guard();
         set_secret(&k("EMPTY"), b"").unwrap();
         assert_eq!(get_secret(&k("EMPTY")).unwrap(), "");
     }
 
     #[test]
     fn multiline_value() {
+        let _guard = test_guard();
         let secret = "line1\nline2\r\nline3";
         set_secret(&k("ML"), secret.as_bytes()).unwrap();
         assert_eq!(get_secret(&k("ML")).unwrap(), secret);
@@ -374,6 +375,7 @@ mod tests {
 
     #[test]
     fn unicode_value() {
+        let _guard = test_guard();
         let secret = "café 🚀 ñoño";
         set_secret(&k("UNI"), secret.as_bytes()).unwrap();
         assert_eq!(get_secret(&k("UNI")).unwrap(), secret);
@@ -381,6 +383,7 @@ mod tests {
 
     #[test]
     fn non_utf8_rejected_on_get() {
+        let _guard = test_guard();
         set_secret(&k("BIN"), &[0xFF, 0xFE, 0x00]).unwrap();
         let err = get_secret(&k("BIN")).unwrap_err();
         assert!(err.contains("invalid UTF-8"), "{err}");
@@ -388,12 +391,14 @@ mod tests {
 
     #[test]
     fn special_chars_in_name() {
+        let _guard = test_guard();
         set_secret("TEST_UNDER_SCORE.DOT-DASH", b"val").unwrap();
         assert_eq!(get_secret("TEST_UNDER_SCORE.DOT-DASH").unwrap(), "val");
     }
 
     #[test]
     fn list_reflects_additions_and_deletions() {
+        let _guard = test_guard();
         set_secret(&k("L1"), b"a").unwrap();
         set_secret(&k("L2"), b"b").unwrap();
         set_secret(&k("L3"), b"c").unwrap();
@@ -416,6 +421,7 @@ mod tests {
 
     #[test]
     fn list_never_contains_values() {
+        let _guard = test_guard();
         set_secret(&k("LV"), b"secret-value-123").unwrap();
         let names = list_secrets().unwrap();
         assert!(names.contains(&k("LV")));
@@ -425,6 +431,7 @@ mod tests {
 
     #[test]
     fn purge_removes_all_for_service() {
+        let _guard = test_guard();
         // Clean up from any previous run, then add three items.
         for name in list_secrets().unwrap() {
             if name.starts_with("TEST_P") {
@@ -446,6 +453,7 @@ mod tests {
 
     #[test]
     fn purge_empty_returns_zero() {
+        let _guard = test_guard();
         for name in list_secrets().unwrap() {
             if name.starts_with("TEST_") {
                 let _ = delete_secret(&name);
