@@ -5,9 +5,8 @@
 // without prompting), and exec mode with literal env vars.
 //
 // The two #[ignore]d tests (`set_reads_from_stdin_pipe` and
-// `set_creates_permissive_acl`) call `vault set`, which invokes SecItemAdd
-// and triggers a macOS keychain approval dialog each time the vault binary
-// is rebuilt (new cdhash). Run them explicitly with:
+// `set_creates_user_presence_item`) call `vault set`, which invokes SecItemAdd
+// and may trigger a macOS authentication prompt. Run them explicitly with:
 //
 //     cargo test -- --ignored
 
@@ -124,10 +123,10 @@ fn ls_rejects_extra_args() {
     assert!(!vault(&["ls", "EXTRA"]).unwrap().status.success());
 }
 
-/// This test writes to the real macOS keychain, which triggers an approval
-/// dialog each time the vault binary is rebuilt. Only run with `--ignored`.
+/// This test writes to the real macOS keychain and may trigger authentication.
+/// Only run with `--ignored`.
 #[test]
-#[ignore = "triggers macOS keychain prompt on each rebuild"]
+#[ignore = "requires macOS keychain authentication"]
 fn set_reads_from_stdin_pipe() {
     let out = vault_stdin(&["set", "VAULT_TEST_PIPE"], "piped-value").unwrap();
     assert!(
@@ -237,24 +236,16 @@ fn exec_preserves_stderr() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("err-to-stderr"));
 }
 
-/// Regression: items created by `vault set` must have permissive ACLs
-/// (`applications: <null>`), so they survive vault rebuilds.
+/// Regression: items created by `vault set` must use the protected service
+/// namespace. The value itself is guarded by user presence through the
+/// `kSecAccessControlUserPresence` policy in `keychain.rs`.
 ///
-/// On macOS, SecItemAdd stamps each new keychain item with an ACL entry that
-/// restricts access to the exact calling binary (by path + cdhash). Every
-/// `cargo build` changes the cdhash, so without the fix in keychain.rs
-/// (SecKeychainItemSetAccess after creation), each rebuild would lock vault
-/// out of its own secrets.
-///
-/// This test verifies the ACL is permissive by dumping the real keychain
-/// and asserting `applications: <null>` appears in the item's access block.
-///
-/// Gated because SecItemAdd triggers a macOS keychain approval dialog each
-/// time the vault binary is rebuilt. Run with `cargo test -- --ignored`.
+/// Gated because SecItemAdd may trigger a macOS authentication prompt. Run
+/// with `cargo test -- --ignored`.
 #[test]
-#[ignore = "triggers macOS keychain prompt on each rebuild"]
-fn set_creates_permissive_acl() {
-    let name = "VAULT_TEST_ACL_REGRESSION";
+#[ignore = "requires macOS keychain authentication"]
+fn set_creates_user_presence_item() {
+    let name = "VAULT_TEST_USER_PRESENCE_REGRESSION";
 
     // Set a secret via stdin pipe
     let out = vault_stdin(&["set", name], "acl-test-value").unwrap();
@@ -264,16 +255,14 @@ fn set_creates_permissive_acl() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Verify the ACL on the keychain item is permissive
+    // Verify the item is in the protected service namespace.
     let dump = std::process::Command::new("security")
         .args(["dump-keychain", "-a"])
         .output()
         .expect("failed to run security dump-keychain");
     let dump_str = String::from_utf8_lossy(&dump.stdout);
 
-    // Find the section for our item and check for permissive ACL.
-    // The dump groups items by account name; find ours, then look for
-    // "applications: <null>" in the access section that follows.
+    // Find the section for our item and verify the service.
     let after_acct = match dump_str.find(&format!("\"acct\"<blob>=\"{name}\"")) {
         Some(pos) => &dump_str[pos..],
         None => {
@@ -283,22 +272,10 @@ fn set_creates_permissive_acl() {
         }
     };
 
-    // The "applications: <null>" line appears within the access block
-    // (between "access: N entries" and the next keychain item or end).
-    let access_start = after_acct
-        .find("access: ")
-        .expect("access block not found after acct");
-    let access_section = &after_acct[access_start..];
-    // Find the end of this item's section: next item starts with a tab-indented
-    // "0x" attribute or the next "keychain:" header.
-    let access_end = access_section
-        .find("\nkeychain:")
-        .unwrap_or(access_section.len());
-    let access_block = &access_section[..access_end];
-
+    let item_section = &after_acct[..after_acct.find("\nkeychain:").unwrap_or(after_acct.len())];
     assert!(
-        access_block.contains("applications: <null>"),
-        "ACL is restrictive — expected 'applications: <null>' in:\n{access_block}"
+        item_section.contains("dev.joshuarli.vault.secure"),
+        "item is not in the protected service namespace:\n{item_section}"
     );
 
     // Clean up

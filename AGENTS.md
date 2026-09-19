@@ -20,11 +20,11 @@ There is no config, no daemon, no networking, no async, no serialization.
 
 Generic Password items in the login Keychain:
 
-- **Service:** `dev.josh.vault`
+- **Service:** `dev.joshuarli.vault.secure`
 - **Account:** the environment variable name
 - **Password:** the secret value
 
-Operations use `security_framework::passwords::{get,set,delete}_generic_password`. Listing uses `ItemSearchOptions` with `simplify_dict()` to extract the `"acct"` key. Empty keychain returns `[]` (we catch `errSecItemNotFound`).
+New items use `kSecAccessControlUserPresence`, so reading a value requires Touch ID or the login password. Listing uses `ItemSearchOptions` with `simplify_dict()` to extract the `"acct"` key. Empty keychain returns `[]` (we catch `errSecItemNotFound`). Older items remain in the legacy `dev.joshuarli.vault` namespace and are intentionally not read; `set`, `rm`, and `purge` clean up legacy entries.
 
 ## Exec mode
 

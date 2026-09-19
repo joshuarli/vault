@@ -32,7 +32,7 @@ security import /tmp/vault-cert.p12 \
 rm /tmp/vault-key.pem /tmp/vault-cert.pem /tmp/vault-cert.p12
 ```
 
-Code-signing gives vault a stable identity so macOS stops prompting for keychain access on every rebuild.
+Code-signing gives vault a stable application identity; it does not bypass the authentication required for secret values.
 
 ### Prebuilt binary
 
@@ -42,15 +42,14 @@ Download the `vault` binary for your architecture, then:
 # Remove the quarantine flag (macOS Gatekeeper)
 xattr -d com.apple.quarantine vault
 
-# Ad-hoc sign it. This gives the binary a stable identity so macOS only
-# asks for keychain access once.
+# Ad-hoc sign it. This gives the binary a stable application identity.
 codesign --sign - --force --timestamp=none vault
 
 # Move it somewhere on your PATH
 mv vault ~/usr/bin/vault
 ```
 
-The ad-hoc signature (`--sign -`) ties the identity to this exact binary — it won't survive updates, but you won't rebuild either. Each new download will prompt once for keychain access.
+The ad-hoc signature (`--sign -`) ties the identity to this exact binary — it won't survive updates, but you won't rebuild either. Secret reads still require Touch ID or the login password.
 
 ### Store a secret
 
@@ -70,7 +69,9 @@ pbpaste | vault set OPENAI_API_KEY
 vault get OPENAI_API_KEY
 ```
 
-Prints the value and nothing else. Safe for `$(...)`.
+Prompts for Touch ID or the login password, then prints the value and nothing else. Safe for `$(...)`.
+
+Secrets saved by older versions are intentionally not read by the protected namespace. Re-save each existing secret with `vault set NAME`; `vault rm NAME` and `vault purge` also clean up entries from the legacy namespace.
 
 ### Delete a secret
 
@@ -92,7 +93,7 @@ Names only, never values.
 vault OPENAI_API_KEY DATABASE_URL -- cargo run
 ```
 
-Looks up `OPENAI_API_KEY` and `DATABASE_URL` in the Keychain and injects them as environment variables.
+Authenticates before looking up `OPENAI_API_KEY` and `DATABASE_URL` in the Keychain, then injects them as environment variables.
 
 Mix with literal values:
 
@@ -105,4 +106,3 @@ No `--`, no exec:
 ```bash
 vault OPENAI_API_KEY cargo run   # error: expected '--' before command
 ```
-

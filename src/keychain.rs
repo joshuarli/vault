@@ -1,45 +1,26 @@
-const SERVICE: &str = "dev.joshuarli.vault";
+const SERVICE: &str = "dev.joshuarli.vault.secure";
+#[cfg(not(test))]
+const LEGACY_SERVICE: &str = "dev.joshuarli.vault";
 
-// Production implementation — real macOS Keychain via Security framework.
-//
-// Keychain ACL model (important, non-obvious):
-//
-//   When SecItemAdd creates a keychain item, macOS automatically adds an
-//   application-specific ACL entry that restricts access to the exact binary
-//   that created it (matched by filesystem path AND cdhash — the code-directory
-//   hash embedded in the ad-hoc signature). Every `cargo build` produces a new
-//   cdhash, so the freshly-built vault binary can't access items created by the
-//   previous build. The old items still exist — macOS just denies access.
-//
-//   The fix: create items with the legacy SecKeychainAddGenericPassword API,
-//   which does NOT stamp an application-specific ACL (items get
-//   `applications: <null>` — any app can access). Updates use the modern
-//   SecItemUpdate, which preserves the existing ACL. Both are single calls.
-//
-// Error reporting:
-//
-//   We preserve the actual Security framework error instead of mapping
-//   everything to "not found". An auth failure (errSecAuthFailed, -25293) and a
-//   genuinely missing item (errSecItemNotFound, -25300) need different
-//   remedies; collapsing them into one message made this bug hard to diagnose.
-//
 #[cfg(not(test))]
 mod imp {
+    use super::{LEGACY_SERVICE, SERVICE};
+    use security_framework::access_control::{ProtectionMode, SecAccessControl};
     use core_foundation::base::TCFType;
     use core_foundation::data::CFData;
     use core_foundation::dictionary::CFDictionary;
     use core_foundation::string::CFString;
     use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
     use security_framework::passwords;
-    use security_framework_sys::base::{SecKeychainItemRef, SecKeychainRef, errSecItemNotFound};
+    use security_framework_sys::access_control::kSecAccessControlUserPresence;
+    use security_framework_sys::base::errSecItemNotFound;
     use security_framework_sys::item::{
-        kSecAttrAccount, kSecAttrService, kSecClass, kSecClassGenericPassword, kSecValueData,
+        kSecAttrAccessControl, kSecAttrAccount, kSecAttrService, kSecClass,
+        kSecClassGenericPassword, kSecValueData,
     };
-    use security_framework_sys::keychain::{
-        SecKeychainAddGenericPassword, SecKeychainCopyDefault, SecKeychainFindGenericPassword,
-    };
-    use security_framework_sys::keychain_item::{SecItemUpdate, SecKeychainItemDelete};
-    use std::ffi::{CString, c_void};
+    use security_framework_sys::keychain_item::{SecItemAdd, SecItemUpdate};
+    use std::ffi::c_void;
+    use std::ptr;
 
     // Pointer-type coercion helper. The kSec* constants from
     // security-framework-sys are typed as CFStringRef = *const __CFString;
@@ -76,39 +57,54 @@ mod imp {
         CFDictionary::from_CFType_pairs(&pairs)
     }
 
-    /// Create a new keychain item. Uses the legacy SecKeychainAddGenericPassword
-    /// API because it creates items with `applications: <null>` in a single
-    /// call — no ACL fix-up step needed.
     fn create(service: &str, name: &str, value: &[u8]) -> Result<(), String> {
-        let service_c =
-            CString::new(service).map_err(|e| format!("vault: invalid service name: {e}"))?;
-        let account_c =
-            CString::new(name).map_err(|e| format!("vault: invalid account name: {e}"))?;
+        let access_control = SecAccessControl::create_with_protection(
+            Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
+            kSecAccessControlUserPresence,
+        )
+        .map_err(|e| format!("vault: set failed: {e}"))?;
 
-        let mut keychain: SecKeychainRef = std::ptr::null_mut();
-        let status = unsafe { SecKeychainCopyDefault(&mut keychain) };
-        if status != 0 {
-            return Err(format!(
-                "vault: set failed: SecKeychainCopyDefault OSStatus {status}"
-            ));
-        }
-
+        let pairs: Vec<(CFString, core_foundation::base::CFType)> = vec![
+            (
+                unsafe { sec_str(k!(kSecClass)) },
+                unsafe { sec_str(k!(kSecClassGenericPassword)) }.into_CFType(),
+            ),
+            (
+                unsafe { sec_str(k!(kSecAttrService)) },
+                CFString::from(service).into_CFType(),
+            ),
+            (
+                unsafe { sec_str(k!(kSecAttrAccount)) },
+                CFString::from(name).into_CFType(),
+            ),
+            (
+                unsafe { sec_str(k!(kSecValueData)) },
+                CFData::from_buffer(value).into_CFType(),
+            ),
+            (
+                unsafe { sec_str(k!(kSecAttrAccessControl)) },
+                access_control.into_CFType(),
+            ),
+        ];
+        let attributes = CFDictionary::from_CFType_pairs(&pairs);
         let status = unsafe {
-            SecKeychainAddGenericPassword(
-                keychain,
-                service_c.as_bytes().len() as u32,
-                service_c.as_ptr(),
-                account_c.as_bytes().len() as u32,
-                account_c.as_ptr(),
-                value.len() as u32,
-                value.as_ptr() as *const c_void,
-                std::ptr::null_mut(),
+            SecItemAdd(
+                attributes.as_concrete_TypeRef(),
+                ptr::null_mut(),
             )
         };
         if status != 0 {
             return Err(format!("vault: set failed: OSStatus {status}"));
         }
         Ok(())
+    }
+
+    fn cleanup_legacy(name: &str) -> Result<(), String> {
+        match passwords::delete_generic_password(LEGACY_SERVICE, name) {
+            Ok(()) => Ok(()),
+            Err(e) if e.code() == errSecItemNotFound => Ok(()),
+            Err(e) => Err(format!("vault: {name}: legacy cleanup failed: {e}")),
+        }
     }
 
     pub fn set(service: &str, name: &str, value: &[u8]) -> Result<(), String> {
@@ -125,11 +121,12 @@ mod imp {
             unsafe { SecItemUpdate(query.as_concrete_TypeRef(), update.as_concrete_TypeRef()) };
 
         if status == 0 {
-            return Ok(());
+            return cleanup_legacy(name);
         }
 
         if status == errSecItemNotFound {
-            return create(service, name, value);
+            create(service, name, value)?;
+            return cleanup_legacy(name);
         }
 
         Err(format!(
@@ -144,46 +141,34 @@ mod imp {
     }
 
     pub fn remove(service: &str, name: &str) -> Result<(), String> {
-        let service_c =
-            CString::new(service).map_err(|e| format!("vault: invalid service name: {e}"))?;
-        let account_c =
-            CString::new(name).map_err(|e| format!("vault: invalid account name: {e}"))?;
-
-        // Use the legacy API to find and delete. Like create(), this bypasses
-        // the application-specific ACL that SecItemAdd stamps on new items.
-        let mut item: SecKeychainItemRef = std::ptr::null_mut();
-        let status = unsafe {
-            SecKeychainFindGenericPassword(
-                std::ptr::null_mut(),
-                service_c.as_bytes().len() as u32,
-                service_c.as_ptr(),
-                account_c.as_bytes().len() as u32,
-                account_c.as_ptr(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut item,
-            )
-        };
-        if status == errSecItemNotFound {
-            return Err(format!("vault: {name}: not found"));
+        match passwords::delete_generic_password(service, name) {
+            Ok(()) => cleanup_legacy(name),
+            Err(e) if e.code() == errSecItemNotFound && service == SERVICE => {
+                match passwords::delete_generic_password(LEGACY_SERVICE, name) {
+                    Ok(()) => Ok(()),
+                    Err(legacy) if legacy.code() == errSecItemNotFound => {
+                        Err(format!("vault: {name}: not found"))
+                    }
+                    Err(legacy) => Err(format!("vault: {name}: {legacy}")),
+                }
+            }
+            Err(e) => Err(format!("vault: {name}: delete failed: {e}")),
         }
-        if status != 0 {
-            return Err(format!("vault: {name}: find failed: OSStatus {status}"));
-        }
-        let del_status = unsafe { SecKeychainItemDelete(item) };
-        if del_status != 0 {
-            return Err(format!(
-                "vault: {name}: delete failed: OSStatus {del_status}"
-            ));
-        }
-        Ok(())
     }
 
     pub fn purge(service: &str) -> Result<usize, String> {
         let names = list(service)?;
-        let count = names.len();
+        let mut count = names.len();
         for name in &names {
             remove(service, name)?;
+        }
+
+        if service == SERVICE {
+            let legacy_names = list(LEGACY_SERVICE)?;
+            count += legacy_names.len();
+            for name in &legacy_names {
+                remove(LEGACY_SERVICE, name)?;
+            }
         }
         Ok(count)
     }
